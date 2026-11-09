@@ -2,11 +2,26 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const { ethers } = require('ethers'); // <-- ADDED FOR REAL BLOCKCHAIN
 const pool = require('./db');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// --- REAL ETHEREUM SEPOLIA CONFIGURATION ---
+const CONTRACT_ADDRESS = "0xA5d9299cC1A77CE65B2f87e662012981555F92ad"; // YOUR REAL ADDRESS
+const PRIVATE_KEY = process.env.PRIVATE_KEY; 
+const SEPOLIA_RPC = "https://ethereum-sepolia-rpc.publicnode.com"; 
+
+const ABI = [
+    "function confirmBooking(uint256 _bookingId, uint256 _propertyId, string memory _studentName, uint256 _amount) public"
+];
+
+const provider = new ethers.JsonRpcProvider(SEPOLIA_RPC);
+const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
+// -------------------------------------------
 
 // ==========================================
 // PROPERTY ROUTES
@@ -30,7 +45,6 @@ app.get('/api/properties/:id', async (req, res) => {
     const result = await pool.query("SELECT * FROM properties WHERE id = $1", [id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Property not found' });
 
-    // NEW: Block access if the property is Occupied (unless the user is the landlord/admin)
     if (result.rows[0].status === 'Occupied') {
       return res.status(400).json({ error: 'This property is currently occupied and unavailable.' });
     }
@@ -100,7 +114,7 @@ app.post('/api/bookings/request', async (req, res) => {
   }
 });
 
-// 5. CONFIRM BOOKING & MINE BLOCKCHAIN TRANSACTION
+// 5. CONFIRM BOOKING (Old Route - Kept for compatibility)
 app.post('/api/bookings/confirm', async (req, res) => {
   const { booking_id, property_id } = req.body;
   const client = await pool.connect();
@@ -246,7 +260,7 @@ app.get('/api/bookings/landlord/:id', async (req, res) => {
   }
 });
 
-// 13. Accept Booking (Landlord triggers Blockchain Hash) - SINGLE, CLEAN ROUTE
+// 13. Accept Booking (Landlord triggers REAL Ethereum Transaction)
 app.post('/api/bookings/accept/:id', async (req, res) => {
   const bookingId = req.params.id;
   const client = await pool.connect();
@@ -264,27 +278,37 @@ app.post('/api/bookings/accept/:id', async (req, res) => {
 
     const { student_name, student_id, property_title, price, property_id, landlord_id } = bookingDetails.rows[0];
 
-    // 2. Update statuses
+    // 2. SEND TO REAL ETHEREUM SEPOLIA SMART CONTRACT
+    console.log("📡 Sending transaction to Ethereum Sepolia...");
+    const tx = await contract.confirmBooking(
+        Number(bookingId),
+        Number(property_id),
+        student_name,
+        Math.round(Number(price) * 100) // Converts to integer
+    );
+    
+    console.log("⏳ Waiting for transaction to be mined...");
+    await tx.wait(); // Wait for the real blockchain to confirm
+    console.log("✅ Transaction Mined! Hash:", tx.hash);
+
+    // 3. Update statuses in Postgres
     await client.query("UPDATE bookings SET status = 'Confirmed' WHERE id = $1", [bookingId]);
     await client.query("UPDATE properties SET status = 'Occupied' WHERE id = $1", [property_id]);
-
-    // 3. Generate Ethereum-style Hash
-    const txHash = '0x' + crypto.createHash('sha256').update(`Booking ${bookingId} at ${new Date().toISOString()}`).digest('hex');
     
-    // 4. Save full transaction details to the ledger
+    // 4. Save the REAL Ethereum hash to the ledger
     await client.query(
       `INSERT INTO blockchain_ledger 
       (transaction_hash, action, property_id, student_name, property_title, amount, payment_status) 
       VALUES ($1, 'ConfirmBooking', $2, $3, $4, $5, 'Success')`,
-      [txHash, property_id, `${student_name} (ID: ${student_id})`, `${property_title} (Landlord ID: ${landlord_id})`, price]
+      [tx.hash, property_id, `${student_name} (ID: ${student_id})`, `${property_title} (Landlord ID: ${landlord_id})`, price]
     );
 
     await client.query('COMMIT');
-    res.json({ message: 'Booking Confirmed and Blockchain Hash Generated!' });
+    res.json({ message: 'Booking Confirmed on Real Blockchain!', txHash: tx.hash });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error(err);
-    res.status(500).json({ error: 'Failed to confirm booking' });
+    console.error("Blockchain Error:", err);
+    res.status(500).json({ error: 'Failed to confirm booking on blockchain.' });
   } finally {
     client.release();
   }
@@ -302,7 +326,7 @@ app.post('/api/bookings/reject/:id', async (req, res) => {
 });
 
 // ==========================================
-// AUTHENTICATION ROUTES (UPDATED)
+// AUTHENTICATION ROUTES
 // ==========================================
 
 // 14. Register a new user
@@ -328,7 +352,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// 15. Login (UPDATED to include student_number)
+// 15. Login
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
