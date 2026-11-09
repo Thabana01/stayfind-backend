@@ -204,13 +204,13 @@ app.delete('/api/admin/properties/:id', async (req, res) => {
 // BOOKING ROUTES (Dynamic)
 // ==========================================
 
-// 11. Get bookings for a specific student (UPDATED to show landlord name)
+// 11. Get bookings for a specific student
 app.get('/api/bookings/student/:id', async (req, res) => {
   const { id } = req.params;
   try {
     const result = await pool.query(`
       SELECT 
-        b.id, b.status, 
+        b.id, b.status, b.property_id,
         p.title, p.location, p.price, 
         u.full_name as landlord_name, 
         u.email as landlord_email
