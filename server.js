@@ -250,13 +250,13 @@ app.post('/api/bookings/accept/:id', async (req, res) => {
 });
 
 // ==========================================
-// AUTHENTICATION ROUTES
+// AUTHENTICATION ROUTES (UPDATED)
 // ==========================================
 
-// 14. Register a new user
+// 14. Register a new user (UPDATED to save student_number and property_details)
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { full_name, email, password, role } = req.body;
+    const { full_name, email, password, role, student_number, property_details } = req.body;
     
     const userCheck = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
     if (userCheck.rows.length > 0) {
@@ -264,8 +264,9 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     const newUser = await pool.query(
-      "INSERT INTO users (full_name, email, password, role, verification_status) VALUES ($1, $2, $3, $4, 'Pending') RETURNING id, full_name, role, verification_status",
-      [full_name, email, password, role]
+      `INSERT INTO users (full_name, email, password, role, verification_status, student_number, property_details) 
+       VALUES ($1, $2, $3, $4, 'Pending', $5, $6) RETURNING id, full_name, role, verification_status`,
+      [full_name, email, password, role, student_number || null, property_details || null]
     );
     
     res.json({ message: 'Registration successful! Please wait for Admin approval.', user: newUser.rows[0] });
@@ -275,7 +276,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// 15. Login
+// 15. Login (UPDATED to block unverified users)
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -289,6 +290,11 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
+    // CHECK IF VERIFIED
+    if (user.rows[0].verification_status !== 'Approved') {
+      return res.status(403).json({ error: 'Your account is pending Admin approval. Please wait.' });
+    }
+
     res.json({ message: 'Login successful', user: user.rows[0] });
   } catch (err) {
     console.error(err);
@@ -297,13 +303,13 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ==========================================
-// ADMIN USER VERIFICATION ROUTES
+// ADMIN USER VERIFICATION ROUTES (UPDATED)
 // ==========================================
 
-// 16. Admin: Get all users
+// 16. Admin: Get all users (UPDATED to fetch the new fields)
 app.get('/api/admin/users', async (req, res) => {
   try {
-    const result = await pool.query("SELECT id, role, full_name, email, verification_status FROM users ORDER BY id ASC");
+    const result = await pool.query("SELECT id, role, full_name, email, verification_status, student_number, property_details FROM users ORDER BY id ASC");
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -338,7 +344,7 @@ app.post('/api/bookings/pay/:id', async (req, res) => {
       `UPDATE bookings 
        SET status = 'Paid', payment_method = $1, payment_reference = $2, payment_amount = $3, paid_at = NOW() 
        WHERE id = $4`, 
-      [payment_method, ref, amount, id]
+      [paymentMethod, ref, amount, id] // Fixed a typo here (payment_method)
     );
     
     res.json({ message: 'Payment successful', reference: ref });
@@ -498,6 +504,7 @@ app.get('/api/admin/analytics', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch analytics' });
   }
 });
+
 // 26. AI MODEL: Train & Predict Prices (Dynamic)
 app.get('/api/ai-model/train', async (req, res) => {
   try {
@@ -548,6 +555,7 @@ app.get('/api/ai-model/train', async (req, res) => {
     res.status(500).json({ error: 'Failed to train model' });
   }
 });
+
 // 27. Admin: Export Properties to CSV (Excel)
 app.get('/api/admin/export-csv', async (req, res) => {
   try {
@@ -572,6 +580,7 @@ app.get('/api/admin/export-csv', async (req, res) => {
     res.status(500).json({ error: 'Failed to generate CSV' });
   }
 });
+
 // Start Server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
