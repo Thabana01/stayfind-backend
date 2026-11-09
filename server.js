@@ -110,7 +110,7 @@ app.post('/api/bookings/confirm', async (req, res) => {
     await client.query("UPDATE properties SET status = 'Occupied' WHERE id = $1", [property_id]);
 
     const transactionData = `Property ${property_id} booked. Timestamp: ${new Date().toISOString()}`;
-    const txHash = crypto.createHash('sha256').update(transactionData).digest('hex');
+    const txHash = '0x' + crypto.createHash('sha256').update(transactionData).digest('hex');
 
     await client.query(
       "INSERT INTO blockchain_ledger (transaction_hash, action, property_id) VALUES ($1, $2, $3)",
@@ -238,7 +238,7 @@ app.get('/api/bookings/landlord/:id', async (req, res) => {
   }
 });
 
-// 13. Accept Booking (Landlord triggers Blockchain Hash)
+// 13. Accept Booking (Landlord triggers Blockchain Hash) - UPDATED FOR ETHEREUM STYLE
 app.post('/api/bookings/accept/:id', async (req, res) => {
   const bookingId = req.params.id;
   const client = await pool.connect();
@@ -246,23 +246,36 @@ app.post('/api/bookings/accept/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    const bookingRes = await client.query("SELECT property_id FROM bookings WHERE id = $1", [bookingId]);
-    const propertyId = bookingRes.rows[0].property_id;
+    // 1. Fetch full details for the ledger
+    const bookingDetails = await client.query(`
+      SELECT b.student_name, b.student_id, p.title as property_title, p.price, p.id as property_id, p.landlord_id
+      FROM bookings b
+      JOIN properties p ON b.property_id = p.id
+      WHERE b.id = $1
+    `, [bookingId]);
 
+    const { student_name, student_id, property_title, price, property_id, landlord_id } = bookingDetails.rows[0];
+
+    // 2. Update statuses
     await client.query("UPDATE bookings SET status = 'Confirmed' WHERE id = $1", [bookingId]);
-    await client.query("UPDATE properties SET status = 'Occupied' WHERE id = $1", [propertyId]);
+    await client.query("UPDATE properties SET status = 'Occupied' WHERE id = $1", [property_id]);
 
-    const txHash = crypto.createHash('sha256').update(`Booking ${bookingId} confirmed at ${new Date().toISOString()}`).digest('hex');
+    // 3. Generate Ethereum-style Hash (0x...)
+    const txHash = '0x' + crypto.createHash('sha256').update(`Booking ${bookingId} at ${new Date().toISOString()}`).digest('hex');
     
+    // 4. Save full transaction details to the ledger
     await client.query(
-      "INSERT INTO blockchain_ledger (transaction_hash, action, property_id) VALUES ($1, 'BOOKING_CONFIRMED', $2)",
-      [txHash, propertyId]
+      `INSERT INTO blockchain_ledger 
+      (transaction_hash, action, property_id, student_name, property_title, amount, payment_status) 
+      VALUES ($1, 'ConfirmBooking', $2, $3, $4, $5, 'Success')`,
+      [txHash, property_id, `${student_name} (ID: ${student_id})`, `${property_title} (Landlord ID: ${landlord_id})`, price]
     );
 
     await client.query('COMMIT');
     res.json({ message: 'Booking Confirmed and Blockchain Hash Generated!' });
   } catch (err) {
     await client.query('ROLLBACK');
+    console.error(err);
     res.status(500).json({ error: 'Failed to confirm booking' });
   } finally {
     client.release();
@@ -321,12 +334,10 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    // CHECK IF SUSPENDED
     if (user.rows[0].account_status === 'Suspended') {
       return res.status(403).json({ error: 'Your account has been suspended by an Admin due to a violation of terms.' });
     }
 
-    // CHECK IF VERIFIED
     if (user.rows[0].verification_status !== 'Approved') {
       return res.status(403).json({ error: 'Your account is pending Admin approval. Please wait.' });
     }
@@ -367,7 +378,7 @@ app.put('/api/admin/users/approve/:id', async (req, res) => {
 app.put('/api/admin/users/suspend/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body; // 'Active' or 'Suspended'
+    const { status } = req.body;
     
     await pool.query("UPDATE users SET account_status = $1 WHERE id = $2", [status, id]);
     res.json({ message: `User account is now ${status}` });
