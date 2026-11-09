@@ -352,13 +352,14 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// 15. Login (UPDATED to block unverified & suspended users)
+// 15. Login
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     
+    // ADDED student_number TO THE SELECT QUERY
     const user = await pool.query(
-      "SELECT id, full_name, role, verification_status, account_status FROM users WHERE email = $1 AND password = $2",
+      "SELECT id, full_name, role, verification_status, account_status, student_number FROM users WHERE email = $1 AND password = $2",
       [email, password]
     );
 
