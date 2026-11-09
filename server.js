@@ -54,16 +54,36 @@ app.post('/api/properties', async (req, res) => {
 // BOOKING & BLOCKCHAIN ROUTES (Part B)
 // ==========================================
 
-// 4. Create a Booking Request
+// 4. Create a Booking Request (UPDATED)
 app.post('/api/bookings/request', async (req, res) => {
   try {
     const { property_id, student_id, student_name, student_number, move_in_date, duration, message } = req.body;
     
+    // 1. Check if property is available
     const propCheck = await pool.query("SELECT status FROM properties WHERE id = $1", [property_id]);
     if (propCheck.rows[0].status !== 'Available') {
       return res.status(400).json({ error: 'Property is no longer available.' });
     }
 
+    // 2. Check if THIS student already has an active booking for this property
+    const existingBooking = await pool.query(
+      "SELECT * FROM bookings WHERE property_id = $1 AND student_id = $2 AND status IN ('Pending', 'Confirmed', 'Paid')",
+      [property_id, student_id]
+    );
+    if (existingBooking.rows.length > 0) {
+      return res.status(400).json({ error: 'You already have an active booking for this property.' });
+    }
+
+    // 3. Check if ANYONE else is already waiting on this property
+    const otherPending = await pool.query(
+      "SELECT * FROM bookings WHERE property_id = $1 AND status IN ('Pending', 'Confirmed', 'Paid')",
+      [property_id]
+    );
+    if (otherPending.rows.length > 0) {
+      return res.status(400).json({ error: 'Another student has already requested this property.' });
+    }
+
+    // 4. Create the Pending Booking
     const newBooking = await pool.query(
       `INSERT INTO bookings 
       (property_id, student_id, status, student_name, student_number, move_in_date, duration, message) 
@@ -249,6 +269,17 @@ app.post('/api/bookings/accept/:id', async (req, res) => {
   }
 });
 
+// 13b. Reject Booking (Landlord)
+app.post('/api/bookings/reject/:id', async (req, res) => {
+  try {
+    const bookingId = req.params.id;
+    await pool.query("UPDATE bookings SET status = 'Declined' WHERE id = $1", [bookingId]);
+    res.json({ message: 'Booking declined.' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to reject booking' });
+  }
+});
+
 // ==========================================
 // AUTHENTICATION ROUTES (UPDATED)
 // ==========================================
@@ -290,7 +321,6 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    // CHECK IF VERIFIED
     if (user.rows[0].verification_status !== 'Approved') {
       return res.status(403).json({ error: 'Your account is pending Admin approval. Please wait.' });
     }
@@ -337,14 +367,13 @@ app.post('/api/bookings/pay/:id', async (req, res) => {
     const { id } = req.params;
     const { payment_method, amount } = req.body;
     
-    // Generate a unique payment reference (e.g., PAY-889912)
     const ref = 'PAY-' + Math.floor(100000 + Math.random() * 900000);
     
     await pool.query(
       `UPDATE bookings 
        SET status = 'Paid', payment_method = $1, payment_reference = $2, payment_amount = $3, paid_at = NOW() 
        WHERE id = $4`, 
-      [paymentMethod, ref, amount, id] // Fixed a typo here (payment_method)
+      [payment_method, ref, amount, id] // Fixed the typo here
     );
     
     res.json({ message: 'Payment successful', reference: ref });
@@ -528,22 +557,19 @@ app.get('/api/ai-model/train', async (req, res) => {
     const avgPrice = totalPrice / properties.length;
     const avgBedrooms = totalBedrooms / properties.length;
     
-    // THIS IS THE MISSING LINE: Calculate real average price per bedroom
     const pricePerBedroom = totalPrice / totalBedrooms;
 
-    // Simulate Model Accuracy
     const baseAccuracy = 85.0;
     const dataBonus = (properties.length * 1.2); 
     const simulatedAccuracy = Math.min(baseAccuracy + dataBonus, 99.2);
 
-    // Base prediction
     const predictedPrice = (avgPrice * 0.8) + (avgBedrooms * 500) + (furnishedCount * 300);
 
     res.json({
       datasetSize: properties.length,
       algorithm: "Linear Regression",
       accuracy: simulatedAccuracy.toFixed(2),
-      pricePerBedroom: Math.round(pricePerBedroom), // <-- NOW SENDING THIS
+      pricePerBedroom: Math.round(pricePerBedroom), 
       prediction: {
         sampleFeatures: { bedrooms: 2, furnished: true },
         predictedRent: Math.round(predictedPrice)
@@ -562,15 +588,12 @@ app.get('/api/admin/export-csv', async (req, res) => {
     const result = await pool.query("SELECT id as property_id, location, type, bedrooms, price, status FROM properties ORDER BY id ASC");
     const properties = result.rows;
 
-    // Create CSV headers
     let csvContent = "property_id,location,type,bedrooms,price,status\n";
 
-    // Add each row
     properties.forEach(p => {
       csvContent += `${p.property_id},"${p.location}","${p.type}",${p.bedrooms},${p.price},"${p.status}"\n`;
     });
 
-    // Set headers to force browser download
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', 'attachment; filename="stayfind_dataset.csv"');
     
