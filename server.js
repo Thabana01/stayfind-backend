@@ -282,17 +282,49 @@ app.post('/api/bookings/accept/:id', async (req, res) => {
   }
 });
 
-// 13b. Reject Booking (Landlord)
-app.post('/api/bookings/reject/:id', async (req, res) => {
+// 13. Accept Booking (Landlord triggers Blockchain Hash)
+app.post('/api/bookings/accept/:id', async (req, res) => {
+  const bookingId = req.params.id;
+  const client = await pool.connect();
+
   try {
-    const bookingId = req.params.id;
-    await pool.query("UPDATE bookings SET status = 'Declined' WHERE id = $1", [bookingId]);
-    res.json({ message: 'Booking declined.' });
+    await client.query('BEGIN');
+
+    // 1. Fetch the full booking details to record on the blockchain
+    const bookingDetails = await client.query(`
+      SELECT b.student_name, b.student_id, p.title as property_title, p.price, p.id as property_id
+      FROM bookings b
+      JOIN properties p ON b.property_id = p.id
+      WHERE b.id = $1
+    `, [bookingId]);
+
+    const { student_name, property_title, price, property_id } = bookingDetails.rows[0];
+
+    // 2. Update statuses
+    await client.query("UPDATE bookings SET status = 'Confirmed' WHERE id = $1", [bookingId]);
+    await client.query("UPDATE properties SET status = 'Occupied' WHERE id = $1", [property_id]);
+
+    // 3. Generate Ethereum-style Hash
+    const txHash = '0x' + crypto.createHash('sha256').update(`Booking ${bookingId} at ${new Date().toISOString()}`).digest('hex');
+    
+    // 4. Save full transaction details
+    await client.query(
+      `INSERT INTO blockchain_ledger 
+      (transaction_hash, action, property_id, student_name, property_title, amount, payment_status) 
+      VALUES ($1, 'ConfirmBooking', $2, $3, $4, $5, 'Success')`,
+      [txHash, property_id, student_name, property_title, price]
+    );
+
+    await client.query('COMMIT');
+    res.json({ message: 'Booking Confirmed and Blockchain Hash Generated!' });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to reject booking' });
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Failed to confirm booking' });
+  } finally {
+    client.release();
   }
 });
-
 // ==========================================
 // AUTHENTICATION ROUTES (UPDATED)
 // ==========================================
