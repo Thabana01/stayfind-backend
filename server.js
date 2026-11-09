@@ -54,18 +54,16 @@ app.post('/api/properties', async (req, res) => {
 // BOOKING & BLOCKCHAIN ROUTES (Part B)
 // ==========================================
 
-// 4. Create a Booking Request (UPDATED)
+// 4. Create a Booking Request
 app.post('/api/bookings/request', async (req, res) => {
   try {
     const { property_id, student_id, student_name, student_number, move_in_date, duration, message } = req.body;
     
-    // 1. Check if property is available
     const propCheck = await pool.query("SELECT status FROM properties WHERE id = $1", [property_id]);
     if (propCheck.rows[0].status !== 'Available') {
       return res.status(400).json({ error: 'Property is no longer available.' });
     }
 
-    // 2. Check if THIS student already has an active booking for this property
     const existingBooking = await pool.query(
       "SELECT * FROM bookings WHERE property_id = $1 AND student_id = $2 AND status IN ('Pending', 'Confirmed', 'Paid')",
       [property_id, student_id]
@@ -74,7 +72,6 @@ app.post('/api/bookings/request', async (req, res) => {
       return res.status(400).json({ error: 'You already have an active booking for this property.' });
     }
 
-    // 3. Check if ANYONE else is already waiting on this property
     const otherPending = await pool.query(
       "SELECT * FROM bookings WHERE property_id = $1 AND status IN ('Pending', 'Confirmed', 'Paid')",
       [property_id]
@@ -83,7 +80,6 @@ app.post('/api/bookings/request', async (req, res) => {
       return res.status(400).json({ error: 'Another student has already requested this property.' });
     }
 
-    // 4. Create the Pending Booking
     const newBooking = await pool.query(
       `INSERT INTO bookings 
       (property_id, student_id, status, student_name, student_number, move_in_date, duration, message) 
@@ -202,19 +198,25 @@ app.delete('/api/admin/properties/:id', async (req, res) => {
 // BOOKING ROUTES (Dynamic)
 // ==========================================
 
-// 11. Get bookings for a specific student
+// 11. Get bookings for a specific student (UPDATED to show landlord name)
 app.get('/api/bookings/student/:id', async (req, res) => {
   const { id } = req.params;
   try {
     const result = await pool.query(`
-      SELECT b.id, b.status, p.title, p.location, p.price 
+      SELECT 
+        b.id, b.status, 
+        p.title, p.location, p.price, 
+        u.full_name as landlord_name, 
+        u.email as landlord_email
       FROM bookings b
       JOIN properties p ON b.property_id = p.id
+      JOIN users u ON p.landlord_id = u.id
       WHERE b.student_id = $1
       ORDER BY b.id DESC
     `, [id]);
     res.json(result.rows);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: 'Server error fetching bookings' });
   }
 });
@@ -238,7 +240,7 @@ app.get('/api/bookings/landlord/:id', async (req, res) => {
   }
 });
 
-// 13. Accept Booking (Landlord triggers Blockchain Hash) - UPDATED FOR ETHEREUM STYLE
+// 13. Accept Booking (Landlord triggers Blockchain Hash) - SINGLE, CLEAN ROUTE
 app.post('/api/bookings/accept/:id', async (req, res) => {
   const bookingId = req.params.id;
   const client = await pool.connect();
@@ -260,7 +262,7 @@ app.post('/api/bookings/accept/:id', async (req, res) => {
     await client.query("UPDATE bookings SET status = 'Confirmed' WHERE id = $1", [bookingId]);
     await client.query("UPDATE properties SET status = 'Occupied' WHERE id = $1", [property_id]);
 
-    // 3. Generate Ethereum-style Hash (0x...)
+    // 3. Generate Ethereum-style Hash
     const txHash = '0x' + crypto.createHash('sha256').update(`Booking ${bookingId} at ${new Date().toISOString()}`).digest('hex');
     
     // 4. Save full transaction details to the ledger
@@ -282,49 +284,17 @@ app.post('/api/bookings/accept/:id', async (req, res) => {
   }
 });
 
-// 13. Accept Booking (Landlord triggers Blockchain Hash)
-app.post('/api/bookings/accept/:id', async (req, res) => {
-  const bookingId = req.params.id;
-  const client = await pool.connect();
-
+// 13b. Reject Booking (Landlord)
+app.post('/api/bookings/reject/:id', async (req, res) => {
   try {
-    await client.query('BEGIN');
-
-    // 1. Fetch the full booking details to record on the blockchain
-    const bookingDetails = await client.query(`
-      SELECT b.student_name, b.student_id, p.title as property_title, p.price, p.id as property_id
-      FROM bookings b
-      JOIN properties p ON b.property_id = p.id
-      WHERE b.id = $1
-    `, [bookingId]);
-
-    const { student_name, property_title, price, property_id } = bookingDetails.rows[0];
-
-    // 2. Update statuses
-    await client.query("UPDATE bookings SET status = 'Confirmed' WHERE id = $1", [bookingId]);
-    await client.query("UPDATE properties SET status = 'Occupied' WHERE id = $1", [property_id]);
-
-    // 3. Generate Ethereum-style Hash
-    const txHash = '0x' + crypto.createHash('sha256').update(`Booking ${bookingId} at ${new Date().toISOString()}`).digest('hex');
-    
-    // 4. Save full transaction details
-    await client.query(
-      `INSERT INTO blockchain_ledger 
-      (transaction_hash, action, property_id, student_name, property_title, amount, payment_status) 
-      VALUES ($1, 'ConfirmBooking', $2, $3, $4, $5, 'Success')`,
-      [txHash, property_id, student_name, property_title, price]
-    );
-
-    await client.query('COMMIT');
-    res.json({ message: 'Booking Confirmed and Blockchain Hash Generated!' });
+    const bookingId = req.params.id;
+    await pool.query("UPDATE bookings SET status = 'Declined' WHERE id = $1", [bookingId]);
+    res.json({ message: 'Booking declined.' });
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(err);
-    res.status(500).json({ error: 'Failed to confirm booking' });
-  } finally {
-    client.release();
+    res.status(500).json({ error: 'Failed to reject booking' });
   }
 });
+
 // ==========================================
 // AUTHENTICATION ROUTES (UPDATED)
 // ==========================================
@@ -352,12 +322,11 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// 15. Login
+// 15. Login (UPDATED to include student_number)
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     
-    // ADDED student_number TO THE SELECT QUERY
     const user = await pool.query(
       "SELECT id, full_name, role, verification_status, account_status, student_number FROM users WHERE email = $1 AND password = $2",
       [email, password]
@@ -383,10 +352,10 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ==========================================
-// ADMIN USER VERIFICATION ROUTES (UPDATED)
+// ADMIN USER VERIFICATION ROUTES
 // ==========================================
 
-// 16. Admin: Get all users (UPDATED to include account_status)
+// 16. Admin: Get all users
 app.get('/api/admin/users', async (req, res) => {
   try {
     const result = await pool.query("SELECT id, role, full_name, email, verification_status, account_status, student_number, property_details FROM users ORDER BY id ASC");
@@ -407,7 +376,7 @@ app.put('/api/admin/users/approve/:id', async (req, res) => {
   }
 });
 
-// 17b. Admin: Suspend or Activate a user (NEW)
+// 17b. Admin: Suspend or Activate a user
 app.put('/api/admin/users/suspend/:id', async (req, res) => {
   try {
     const { id } = req.params;
