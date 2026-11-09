@@ -284,7 +284,7 @@ app.post('/api/bookings/reject/:id', async (req, res) => {
 // AUTHENTICATION ROUTES (UPDATED)
 // ==========================================
 
-// 14. Register a new user (UPDATED to save student_number and property_details)
+// 14. Register a new user
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { full_name, email, password, role, student_number, property_details } = req.body;
@@ -307,13 +307,13 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// 15. Login (UPDATED to block unverified users)
+// 15. Login (UPDATED to block unverified & suspended users)
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     
     const user = await pool.query(
-      "SELECT id, full_name, role, verification_status FROM users WHERE email = $1 AND password = $2",
+      "SELECT id, full_name, role, verification_status, account_status FROM users WHERE email = $1 AND password = $2",
       [email, password]
     );
 
@@ -321,6 +321,12 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
+    // CHECK IF SUSPENDED
+    if (user.rows[0].account_status === 'Suspended') {
+      return res.status(403).json({ error: 'Your account has been suspended by an Admin due to a violation of terms.' });
+    }
+
+    // CHECK IF VERIFIED
     if (user.rows[0].verification_status !== 'Approved') {
       return res.status(403).json({ error: 'Your account is pending Admin approval. Please wait.' });
     }
@@ -336,10 +342,10 @@ app.post('/api/auth/login', async (req, res) => {
 // ADMIN USER VERIFICATION ROUTES (UPDATED)
 // ==========================================
 
-// 16. Admin: Get all users (UPDATED to fetch the new fields)
+// 16. Admin: Get all users (UPDATED to include account_status)
 app.get('/api/admin/users', async (req, res) => {
   try {
-    const result = await pool.query("SELECT id, role, full_name, email, verification_status, student_number, property_details FROM users ORDER BY id ASC");
+    const result = await pool.query("SELECT id, role, full_name, email, verification_status, account_status, student_number, property_details FROM users ORDER BY id ASC");
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -357,8 +363,21 @@ app.put('/api/admin/users/approve/:id', async (req, res) => {
   }
 });
 
+// 17b. Admin: Suspend or Activate a user (NEW)
+app.put('/api/admin/users/suspend/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body; // 'Active' or 'Suspended'
+    
+    await pool.query("UPDATE users SET account_status = $1 WHERE id = $2", [status, id]);
+    res.json({ message: `User account is now ${status}` });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ==========================================
-// PAYMENT ROUTE (UPDATED)
+// PAYMENT ROUTE
 // ==========================================
 
 // 18. Process Simulated Payment
@@ -373,7 +392,7 @@ app.post('/api/bookings/pay/:id', async (req, res) => {
       `UPDATE bookings 
        SET status = 'Paid', payment_method = $1, payment_reference = $2, payment_amount = $3, paid_at = NOW() 
        WHERE id = $4`, 
-      [payment_method, ref, amount, id] // Fixed the typo here
+      [payment_method, ref, amount, id] 
     );
     
     res.json({ message: 'Payment successful', reference: ref });
@@ -436,7 +455,7 @@ app.get('/api/inbox/:userId', async (req, res) => {
     console.log(`✅ BACKEND: Found ${result.rows.length} contacts`);
     res.json(result.rows);
   } catch (err) {
-    console.error("❌ BACKEND INBOX ERROR:", err.message); // This will print the exact SQL error
+    console.error("❌ BACKEND INBOX ERROR:", err.message); 
     res.status(500).json({ error: 'Server error fetching inbox' });
   }
 });
@@ -461,13 +480,13 @@ app.get('/api/users/:id', async (req, res) => {
 app.put('/api/landlord/properties/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, location, price, type, bedrooms, status } = req.body;
+    const { title, location, price, type, bedrooms, status, image_url } = req.body;
     
     const updatedProp = await pool.query(
       `UPDATE properties 
-       SET title = $1, location = $2, price = $3, type = $4, bedrooms = $5, status = $6
-       WHERE id = $7 RETURNING *`,
-      [title, location, price, type, bedrooms, status, id]
+       SET title = $1, location = $2, price = $3, type = $4, bedrooms = $5, status = $6, image_url = $7
+       WHERE id = $8 RETURNING *`,
+      [title, location, price, type, bedrooms, status, image_url, id]
     );
     
     res.json(updatedProp.rows[0]);
