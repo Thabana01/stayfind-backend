@@ -28,7 +28,6 @@ const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
 // ==========================================
 
 // 1. Get all available properties
-// ✏️ EDITED: Hide properties whose landlord is suspended
 app.get('/api/properties', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -46,7 +45,6 @@ app.get('/api/properties', async (req, res) => {
 });
 
 // 2. Get a single property by ID
-// ✏️ EDITED: Block access to suspended landlord's property / blocked property
 app.get('/api/properties/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -97,7 +95,6 @@ app.post('/api/properties', async (req, res) => {
 // ==========================================
 
 // 4. Create a Booking Request
-// ✏️ EDITED: Reject if landlord suspended or property blocked
 app.post('/api/bookings/request', async (req, res) => {
   try {
     const { property_id, student_id, student_name, student_number, move_in_date, duration, message } = req.body;
@@ -210,7 +207,6 @@ app.get('/api/admin/stats', async (req, res) => {
 // ==========================================
 
 // 8. Admin: Get ALL properties
-// ✏️ EDITED (optional): Include landlord_status + landlord_name for admin view
 app.get('/api/admin/properties', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -302,7 +298,6 @@ app.get('/api/bookings/landlord/:id', async (req, res) => {
 });
 
 // 13. Accept Booking (Landlord triggers REAL Ethereum Transaction)
-// ✏️ EDITED: Guard against suspended landlord / blocked property before blockchain call
 app.post('/api/bookings/accept/:id', async (req, res) => {
   const bookingId = req.params.id;
   const client = await pool.connect();
@@ -466,8 +461,6 @@ app.put('/api/admin/users/approve/:id', async (req, res) => {
 });
 
 // 17b. Admin: Suspend or Activate a user
-// ✏️ EDITED (CORE): When landlord is suspended -> block their properties.
-//                    When landlord is reactivated -> unblock their properties.
 app.put('/api/admin/users/suspend/:id', async (req, res) => {
   const client = await pool.connect();
   try {
@@ -634,7 +627,6 @@ app.get('/api/users/:id', async (req, res) => {
 // ==========================================
 
 // 23. Landlord: Update Own Property
-// ✏️ EDITED: Suspended landlords cannot re-list their property as 'Available'
 app.put('/api/landlord/properties/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -788,6 +780,122 @@ app.get('/api/admin/export-csv', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to generate CSV' });
+  }
+});
+
+// ==========================================
+// SCAM REPORT ROUTES (Landlord ↔ Student ↔ Admin)  🆕
+// ==========================================
+
+// 28. Any user: File a report against another user
+app.post('/api/reports', async (req, res) => {
+  try {
+    const { reporter_id, reported_id, reason, description, evidence_url } = req.body;
+
+    if (!reporter_id || !reported_id || !reason || !description) {
+      return res.status(400).json({ error: 'Missing required fields.' });
+    }
+    if (Number(reporter_id) === Number(reported_id)) {
+      return res.status(400).json({ error: 'You cannot report yourself.' });
+    }
+    if (String(description).trim().length < 20) {
+      return res.status(400).json({ error: 'Please provide at least 20 characters of detail.' });
+    }
+
+    // Prevent duplicate pending reports on the same pair
+    const dup = await pool.query(
+      `SELECT id FROM reports
+        WHERE reporter_id = $1 AND reported_id = $2 AND status = 'Pending'`,
+      [reporter_id, reported_id]
+    );
+    if (dup.rows.length > 0) {
+      return res.status(400).json({ error: 'You already have a pending report against this user.' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO reports (reporter_id, reported_id, reason, description, evidence_url)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [reporter_id, reported_id, reason, description, evidence_url || null]
+    );
+
+    res.json({ message: 'Report submitted. Admin will review it shortly.', report: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error submitting report' });
+  }
+});
+
+// 29. Admin: Get all reports (with reporter/reported names joined)
+app.get('/api/admin/reports', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT r.*,
+             rep.full_name AS reporter_name,
+             rep.role AS reporter_role,
+             rep.email AS reporter_email,
+             tgt.full_name AS reported_name,
+             tgt.role AS reported_role,
+             tgt.email AS reported_email,
+             tgt.account_status AS reported_account_status
+        FROM reports r
+        JOIN users rep ON rep.id = r.reporter_id
+        JOIN users tgt ON tgt.id = r.reported_id
+       ORDER BY
+         CASE WHEN r.status = 'Pending' THEN 0 ELSE 1 END,
+         r.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error fetching reports' });
+  }
+});
+
+// 30. Admin: Dismiss a report
+app.put('/api/admin/reports/:id/dismiss', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { admin_note } = req.body;
+    await pool.query(
+      `UPDATE reports
+          SET status = 'Dismissed', admin_note = $1, resolved_at = NOW()
+        WHERE id = $2`,
+      [admin_note || 'No scam evidence found.', id]
+    );
+    res.json({ message: 'Report dismissed.' });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// 31. Admin: Resolve a report (called after taking action on the reported user)
+app.put('/api/admin/reports/:id/resolve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { admin_note } = req.body;
+    await pool.query(
+      `UPDATE reports
+          SET status = 'Resolved', admin_note = $1, resolved_at = NOW()
+        WHERE id = $2`,
+      [admin_note || 'Action taken.', id]
+    );
+    res.json({ message: 'Report resolved.' });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// 32. Get count of a user's pending reports (for "under review" badge)
+app.get('/api/reports/count/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const result = await pool.query(
+      `SELECT COUNT(*) FROM reports WHERE reported_id = $1 AND status = 'Pending'`,
+      [userId]
+    );
+    res.json({ pendingReports: Number(result.rows[0].count) });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
