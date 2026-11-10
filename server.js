@@ -898,6 +898,96 @@ app.get('/api/reports/count/:userId', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+// ==========================================
+// SCAM REPORT ROUTES
+// ==========================================
+app.post('/api/reports', async (req, res) => {
+  try {
+    const { reporter_id, reported_id, reason, description, evidence_url } = req.body;
+    if (!reporter_id || !reported_id || !reason || !description) {
+      return res.status(400).json({ error: 'Missing required fields.' });
+    }
+    if (Number(reporter_id) === Number(reported_id)) {
+      return res.status(400).json({ error: 'You cannot report yourself.' });
+    }
+    if (String(description).trim().length < 20) {
+      return res.status(400).json({ error: 'Please provide at least 20 characters of detail.' });
+    }
+    const dup = await pool.query(
+      `SELECT id FROM reports WHERE reporter_id = $1 AND reported_id = $2 AND status = 'Pending'`,
+      [reporter_id, reported_id]
+    );
+    if (dup.rows.length > 0) {
+      return res.status(400).json({ error: 'You already have a pending report against this user.' });
+    }
+    const result = await pool.query(
+      `INSERT INTO reports (reporter_id, reported_id, reason, description, evidence_url)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [reporter_id, reported_id, reason, description, evidence_url || null]
+    );
+    res.json({ message: 'Report submitted.', report: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error submitting report' });
+  }
+});
+
+app.get('/api/admin/reports', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT r.*, rep.full_name AS reporter_name, rep.role AS reporter_role,
+             tgt.full_name AS reported_name, tgt.role AS reported_role, tgt.account_status AS reported_account_status
+        FROM reports r
+        JOIN users rep ON rep.id = r.reporter_id
+        JOIN users tgt ON tgt.id = r.reported_id
+       ORDER BY CASE WHEN r.status = 'Pending' THEN 0 ELSE 1 END, r.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error fetching reports' });
+  }
+});
+
+app.put('/api/admin/reports/:id/dismiss', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { admin_note } = req.body;
+    await pool.query(
+      `UPDATE reports SET status = 'Dismissed', admin_note = $1, resolved_at = NOW() WHERE id = $2`,
+      [admin_note || 'No scam evidence found.', id]
+    );
+    res.json({ message: 'Report dismissed.' });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.put('/api/admin/reports/:id/resolve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { admin_note } = req.body;
+    await pool.query(
+      `UPDATE reports SET status = 'Resolved', admin_note = $1, resolved_at = NOW() WHERE id = $2`,
+      [admin_note || 'Action taken.', id]
+    );
+    res.json({ message: 'Report resolved.' });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/reports/count/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const result = await pool.query(`SELECT COUNT(*) FROM reports WHERE reported_id = $1 AND status = 'Pending'`, [userId]);
+    res.json({ pendingReports: Number(result.rows[0].count) });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+
 
 // Start Server
 const PORT = process.env.PORT || 5000;
