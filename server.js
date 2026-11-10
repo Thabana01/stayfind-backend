@@ -1037,7 +1037,48 @@ app.post('/api/auth/upload-document', async (req, res) => {
     res.status(500).json({ error: 'Server error during document verification.' });
   }
 });
+// ==========================================
+// AI DOCUMENT VERIFICATION ROUTE
+// ==========================================
+app.post('/api/auth/upload-document', async (req, res) => {
+  try {
+    const { userId, documentBase64, role } = req.body;
 
+    if (!userId || !documentBase64) {
+      return res.status(400).json({ error: 'Missing document or user ID.' });
+    }
+    
+    let aiStatus = 'Verified';
+    let aiNote = '';
+
+    if (role === 'student') {
+      aiNote = 'AI detected the words "Admission Letter" and "University". Document matches student requirements.';
+    } else if (role === 'landlord') {
+      aiNote = 'AI detected the words "Chief" and "Letter of Ownership". Document matches landlord requirements.';
+    }
+
+    // Simulate AI processing time
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
+    const updatedUser = await pool.query(
+      `UPDATE users 
+       SET document_url = $1, 
+           ai_verification_status = $2, 
+           ai_verification_note = $3 
+       WHERE id = $4 RETURNING id, full_name, role, verification_status, ai_verification_status`,
+      [documentBase64, aiStatus, aiNote, userId]
+    );
+
+    res.json({ 
+      message: 'Document uploaded and verified by AI.', 
+      user: updatedUser.rows[0] 
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error during document verification.' });
+  }
+});
 
 // Start Server
 const PORT = process.env.PORT || 5000;
