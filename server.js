@@ -28,9 +28,16 @@ const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
 // ==========================================
 
 // 1. Get all available properties
+// ✏️ EDITED: Hide properties whose landlord is suspended
 app.get('/api/properties', async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM properties WHERE status = 'Available' ORDER BY id ASC");
+    const result = await pool.query(`
+      SELECT p.* FROM properties p
+      JOIN users u ON u.id = p.landlord_id
+      WHERE p.status = 'Available'
+        AND u.account_status IS DISTINCT FROM 'Suspended'
+      ORDER BY p.id ASC
+    `);
     res.json(result.rows);
   } catch (err) {
     console.error(err.message);
@@ -39,11 +46,26 @@ app.get('/api/properties', async (req, res) => {
 });
 
 // 2. Get a single property by ID
+// ✏️ EDITED: Block access to suspended landlord's property / blocked property
 app.get('/api/properties/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await pool.query("SELECT * FROM properties WHERE id = $1", [id]);
+    const result = await pool.query(
+      `SELECT p.*, u.account_status AS landlord_status
+         FROM properties p
+         JOIN users u ON u.id = p.landlord_id
+        WHERE p.id = $1`,
+      [id]
+    );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Property not found' });
+
+    if (result.rows[0].landlord_status === 'Suspended') {
+      return res.status(403).json({ error: 'This listing is unavailable because the landlord account is suspended.' });
+    }
+
+    if (result.rows[0].status === 'Blocked') {
+      return res.status(403).json({ error: 'This property is currently blocked.' });
+    }
 
     if (result.rows[0].status === 'Occupied') {
       return res.status(400).json({ error: 'This property is currently occupied and unavailable.' });
@@ -75,11 +97,24 @@ app.post('/api/properties', async (req, res) => {
 // ==========================================
 
 // 4. Create a Booking Request
+// ✏️ EDITED: Reject if landlord suspended or property blocked
 app.post('/api/bookings/request', async (req, res) => {
   try {
     const { property_id, student_id, student_name, student_number, move_in_date, duration, message } = req.body;
     
-    const propCheck = await pool.query("SELECT status FROM properties WHERE id = $1", [property_id]);
+    const propCheck = await pool.query(
+      `SELECT p.status, u.account_status AS landlord_status
+         FROM properties p
+         JOIN users u ON u.id = p.landlord_id
+        WHERE p.id = $1`,
+      [property_id]
+    );
+    if (propCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Property not found.' });
+    }
+    if (propCheck.rows[0].landlord_status === 'Suspended') {
+      return res.status(403).json({ error: 'This landlord is suspended. Bookings are disabled.' });
+    }
     if (propCheck.rows[0].status !== 'Available') {
       return res.status(400).json({ error: 'Property is no longer available.' });
     }
@@ -175,9 +210,15 @@ app.get('/api/admin/stats', async (req, res) => {
 // ==========================================
 
 // 8. Admin: Get ALL properties
+// ✏️ EDITED (optional): Include landlord_status + landlord_name for admin view
 app.get('/api/admin/properties', async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM properties ORDER BY id ASC");
+    const result = await pool.query(`
+      SELECT p.*, u.account_status AS landlord_status, u.full_name AS landlord_name
+        FROM properties p
+        JOIN users u ON u.id = p.landlord_id
+       ORDER BY p.id ASC
+    `);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -261,6 +302,7 @@ app.get('/api/bookings/landlord/:id', async (req, res) => {
 });
 
 // 13. Accept Booking (Landlord triggers REAL Ethereum Transaction)
+// ✏️ EDITED: Guard against suspended landlord / blocked property before blockchain call
 app.post('/api/bookings/accept/:id', async (req, res) => {
   const bookingId = req.params.id;
   const client = await pool.connect();
@@ -276,7 +318,24 @@ app.post('/api/bookings/accept/:id', async (req, res) => {
       WHERE b.id = $1
     `, [bookingId]);
 
+    if (bookingDetails.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Booking not found.' });
+    }
+
     const { student_name, student_id, property_title, price, property_id, landlord_id } = bookingDetails.rows[0];
+
+    // 1b. Guard: refuse if landlord is suspended or property is blocked
+    const guard = await client.query(
+      `SELECT p.status AS property_status, u.account_status AS landlord_status
+         FROM properties p JOIN users u ON u.id = p.landlord_id
+        WHERE p.id = $1`,
+      [property_id]
+    );
+    if (guard.rows[0]?.landlord_status === 'Suspended' || guard.rows[0]?.property_status === 'Blocked') {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Cannot confirm: landlord suspended or property blocked.' });
+    }
 
     // 2. SEND TO REAL ETHEREUM SEPOLIA SMART CONTRACT
     console.log("📡 Sending transaction to Ethereum Sepolia...");
@@ -407,15 +466,70 @@ app.put('/api/admin/users/approve/:id', async (req, res) => {
 });
 
 // 17b. Admin: Suspend or Activate a user
+// ✏️ EDITED (CORE): When landlord is suspended -> block their properties.
+//                    When landlord is reactivated -> unblock their properties.
 app.put('/api/admin/users/suspend/:id', async (req, res) => {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
-    const { status } = req.body;
-    
-    await pool.query("UPDATE users SET account_status = $1 WHERE id = $2", [status, id]);
-    res.json({ message: `User account is now ${status}` });
+    const { status } = req.body; // 'Suspended' or 'Active'
+
+    await client.query('BEGIN');
+
+    // 1. Update the user's account status
+    const userRes = await client.query(
+      "UPDATE users SET account_status = $1 WHERE id = $2 RETURNING role, full_name",
+      [status, id]
+    );
+    if (userRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    let blockedCount = 0;
+    const role = userRes.rows[0].role;
+
+    // 2. If landlord was suspended -> block all their available properties
+    if (role === 'Landlord' && status === 'Suspended') {
+      const blocked = await client.query(
+        `UPDATE properties SET status = 'Blocked'
+          WHERE landlord_id = $1 AND status = 'Available'
+          RETURNING id`,
+        [id]
+      );
+      blockedCount = blocked.rowCount;
+
+      // Cancel pending bookings on those properties
+      await client.query(
+        `UPDATE bookings SET status = 'Declined'
+          WHERE property_id IN (SELECT id FROM properties WHERE landlord_id = $1)
+            AND status = 'Pending'`,
+        [id]
+      );
+    }
+
+    // 3. If landlord was reactivated -> unblock their properties
+    if (role === 'Landlord' && status === 'Active') {
+      const unblocked = await client.query(
+        `UPDATE properties SET status = 'Available'
+          WHERE landlord_id = $1 AND status = 'Blocked'
+          RETURNING id`,
+        [id]
+      );
+      blockedCount = unblocked.rowCount;
+    }
+
+    await client.query('COMMIT');
+    res.json({
+      message: `User account is now ${status}`,
+      affectedProperties: blockedCount
+    });
   } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
     res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -520,10 +634,21 @@ app.get('/api/users/:id', async (req, res) => {
 // ==========================================
 
 // 23. Landlord: Update Own Property
+// ✏️ EDITED: Suspended landlords cannot re-list their property as 'Available'
 app.put('/api/landlord/properties/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { title, location, price, type, bedrooms, status, image_url } = req.body;
+
+    // Check landlord suspension before allowing status change back to Available
+    const chk = await pool.query(
+      `SELECT u.account_status FROM properties p
+         JOIN users u ON u.id = p.landlord_id WHERE p.id = $1`, [id]
+    );
+    if (chk.rows.length === 0) return res.status(404).json({ error: 'Property not found' });
+    if (chk.rows[0].account_status === 'Suspended' && status === 'Available') {
+      return res.status(403).json({ error: 'Your account is suspended. You cannot re-list this property.' });
+    }
     
     const updatedProp = await pool.query(
       `UPDATE properties 
